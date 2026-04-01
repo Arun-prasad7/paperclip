@@ -1056,6 +1056,22 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
 
+    // Reset auto-restart count when issue completes or is cancelled
+    const isCompleting = existing.status !== "done" && existing.status !== "cancelled" &&
+                        (issue.status === "done" || issue.status === "cancelled");
+    if (isCompleting) {
+      const metadata = (issue.metadata as Record<string, unknown>) || {};
+      if (metadata.autoRestartCount !== undefined) {
+        await svc.update(issue.id, {
+          metadata: {
+            ...metadata,
+            autoRestartCount: undefined,
+          },
+        }).catch((err) =>
+          logger.warn({ err, issueId: issue.id }, "failed to reset auto-restart count"));
+      }
+    }
+
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue activity"));
@@ -1173,6 +1189,80 @@ export function issueRoutes(db: Db, storage: StorageService) {
             ...(interruptedRunId ? { interruptedRunId } : {}),
           },
         });
+      }
+
+      // Auto-unblock parent issue when board request child completes
+      const isBeingCompleted = existing.status !== "done" && issue.status === "done";
+      const isBoardRequest = issue.title.toLowerCase().startsWith("board request:");
+      if (isBeingCompleted && isBoardRequest && existing.parentId) {
+        try {
+          const parent = await svc.getById(existing.parentId);
+          if (parent && parent.status === "blocked") {
+            // Check restart count safety mechanism
+            const metadata = (parent.metadata as Record<string, unknown>) || {};
+            const restartCount = (metadata.autoRestartCount as number) || 0;
+            const maxRestarts = 3;
+
+            if (restartCount >= maxRestarts) {
+              // Max restarts reached, don't auto-unblock
+              await svc.update(parent.id, {
+                comment: `## Max Auto-Restarts Reached\n\nBoard request [${issue.identifier}](/${issue.identifier.split("-")[0]}/issues/${issue.identifier}) has been resolved, but this issue has been auto-unblocked ${restartCount} times already. Manual review required.\n\nPlease manually transition this issue to \`todo\` when ready to resume.`,
+              });
+              logger.info({ issueId: parent.id, restartCount }, "max auto-restarts reached, manual intervention required");
+            } else {
+              // Update parent status to todo with incremented restart count
+              const prefix = issue.identifier.split("-")[0];
+              await svc.update(parent.id, {
+                status: "todo",
+                comment: `## Unblocked\n\nBoard request [${issue.identifier}](/${prefix}/issues/${issue.identifier}) has been resolved. Resuming work.`,
+                metadata: {
+                  ...metadata,
+                  autoRestartCount: restartCount + 1,
+                },
+              });
+
+              // Wake parent assignee
+              if (parent.assigneeAgentId) {
+                wakeups.set(parent.assigneeAgentId, {
+                  source: "automation",
+                  triggerDetail: "system",
+                  reason: "issue_unblocked",
+                  payload: {
+                    issueId: parent.id,
+                    unblockedBy: issue.id,
+                    restartCount: restartCount + 1,
+                  },
+                  requestedByActorType: actor.actorType,
+                  requestedByActorId: actor.actorId,
+                  contextSnapshot: {
+                    issueId: parent.id,
+                    source: "child_issue_completed",
+                  },
+                });
+              }
+
+              await logActivity(db, {
+                companyId: parent.companyId,
+                actorType: "system",
+                actorId: "auto-unblock",
+                agentId: null,
+                runId: actor.runId,
+                action: "issue.auto_unblocked",
+                entityType: "issue",
+                entityId: parent.id,
+                details: {
+                  unblockedBy: issue.id,
+                  unblockedByIdentifier: issue.identifier,
+                  previousStatus: "blocked",
+                  newStatus: "todo",
+                  restartCount: restartCount + 1,
+                },
+              });
+            }
+          }
+        } catch (err) {
+          logger.warn({ err, issueId: issue.id, parentId: existing.parentId }, "failed to auto-unblock parent issue");
+        }
       }
 
       if (commentBody && comment) {
